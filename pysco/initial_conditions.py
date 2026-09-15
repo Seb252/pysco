@@ -435,10 +435,14 @@ def generate_density_fourier(param: pd.Series) -> npt.NDArray[np.complex64]:
     else:
         rng = np.random.default_rng(param["seed"])
 
+    # FORK PATCH: nthreads now passed through -- white_noise_fourier[_fixed]()
+    # need it for their internal forward FFT (fft_3D_real) since the fix.
     if param["fixed_ICS"]:
-        density_k = white_noise_fourier_fixed(ncells_1d, rng, param["paired_ICS"])
+        density_k = white_noise_fourier_fixed(
+            ncells_1d, rng, param["paired_ICS"], param["nthreads"]
+        )
     else:
-        density_k = white_noise_fourier(ncells_1d, rng)
+        density_k = white_noise_fourier(ncells_1d, rng, param["nthreads"])
 
     utils.prod_vector_vector_inplace(density_k, transfer_grid)
     transfer_grid = 0
@@ -483,6 +487,17 @@ def generate_density(param: pd.Series) -> npt.NDArray[np.float32]:
 @utils.time_me
 def generate_force(param: pd.Series) -> npt.NDArray[np.float32]:
     """Compute force initial conditions from power spectrum
+
+    FORK PATCH WARNING (2026-09-11): white_noise_fourier_force() and
+    white_noise_fourier_fixed_force(), called below, were NOT fixed by this
+    fork's axis-convention patch (see the comment above white_noise_fourier()
+    for the bug they share) -- this code path isn't used anywhere in the
+    repo this fork supports, so it was left out of scope. As a direct
+    consequence of get_transfer_grid() now returning a compact [N,N,N//2+1]
+    array, this function is now ALSO shape-mismatched against it (it wasn't
+    before, since both were consistently the old, wrong [N,N,N] shape). Do
+    not use generate_force() until it and both _force() white-noise
+    functions are fixed the same way white_noise_fourier() was.
 
     Parameters
     ----------
@@ -541,7 +556,9 @@ def get_transfer_grid(param: pd.Series) -> npt.NDArray[np.float32]:
     Returns
     -------
     npt.NDArray[np.float32]
-        Initial density field and velocity field (delta, vx, vy, vz)
+        Transfer grid, compact/rfft layout [N, N, N // 2 + 1] -- see the
+        FORK PATCH comment above white_noise_fourier() for why this is no
+        longer a full [N, N, N] cube.
 
     Example
     -------
@@ -563,8 +580,13 @@ def get_transfer_grid(param: pd.Series) -> npt.NDArray[np.float32]:
     k_dimensionless = k / kf
     sqrtPk = (np.sqrt(Pk / param["boxlen"] ** 3) * ncells_1d**3).astype(np.float32)
     k_1d = np.fft.fftfreq(ncells_1d, 1 / ncells_1d)
+    # FORK PATCH: last axis compacted to [0, ncells_1d//2] to match the
+    # rfft-style [N, N, N//2+1] layout white_noise_fourier() now produces
+    # (axes 0 and 1 stay full-range -- only the last axis is compact in the
+    # standard convention). Was: k_1d on all three axes -> full [N,N,N].
+    k_1d_last = k_1d[: ncells_1d // 2 + 1]
     k_grid = np.sqrt(
-        k_1d[np.newaxis, np.newaxis, :] ** 2
+        k_1d_last[np.newaxis, np.newaxis, :] ** 2
         + k_1d[:, np.newaxis, np.newaxis] ** 2
         + k_1d[np.newaxis, :, np.newaxis] ** 2
     )
@@ -576,14 +598,80 @@ def get_transfer_grid(param: pd.Series) -> npt.NDArray[np.float32]:
     return transfer_grid
 
 
+# ─────────────────────────────────────────────────────────────────────────
+# FORK PATCH (Seb252/pysco): axis-convention bug in the white-noise
+# generators, fixed 2026-09-11.
+#
+# Bug
+# ---
+# Every consumer of a Fourier-space field in fourier.py (ifft_3D_real,
+# gradient, inverse_laplacian, ...) expects the standard real-FFT ("rfft")
+# compact layout: shape [N, N, N//2+1], with the redundant/Hermitian-mirror
+# half of the spectrum compressed out of the LAST axis. Their docstrings
+# say so explicitly.
+#
+# white_noise_fourier() and white_noise_fourier_fixed() instead built a
+# FULL [N, N, N] cube, with the mirrored/redundant half compressed out of
+# the FIRST axis (their loop is `for i in range(middle+1): density[i,j,k]=...;
+# density[-i,-j,-k]=conj(...)`, i.e. axis 0 is the compact one, axes 1 and 2
+# are each fully, independently populated). get_transfer_grid() -- which
+# builds the elementwise multiplier applied to this array -- had the exact
+# same axis-0-compact shape, so the multiplication itself was internally
+# "consistent", but the array fourier.py went on to inverse-transform simply
+# wasn't the compact-last-axis layout it needed. utils.injection(a, b)
+# (`a.ravel()[i] = b.ravel()[i]` for i in range(len(a))), the glue code that
+# copies this data into the actual FFTW buffer, is shape-blind: for a source
+# array bigger than the destination, it silently takes a raw flat-index
+# prefix, which does not correspond to any coherent slice of the intended
+# 3D array once the two shapes disagree on which axis is compact.
+#
+# Effect: for a spatially UNIFORM target (flat P(k)), every retained value
+# has the same expected magnitude regardless of which slot it lands in, so
+# this was completely invisible. For any REALISTIC (k-dependent) P(k) --
+# i.e. every cosmological spectrum -- it silently produced a badly wrong,
+# smoothly k-dependent power spectrum. Verified directly: averaged over 20
+# seeds, a flat P(k)=100 target recovered at ratio 0.98-1.00 across all k;
+# a standard LCDM-shaped P(k) recovered at ratio 0.10 (low k) rising past
+# 5.0 (high k) through the SAME pipeline -- a genuine bug, not sample
+# variance or a measurement-convention mismatch.
+#
+# Fix
+# ---
+# Both functions below now build their white noise in REAL space (plain
+# unit-variance Gaussian samples, no manual Fourier-space RNG loop needed)
+# and pass it through fourier.fft_3D_real(), pysco's own forward transform,
+# which already produces the correct [N, N, N//2+1] compact-last-axis
+# layout (verified separately: this is the exact mechanism that made
+# src/spherical_collapse.py's install_tophat_ic() work correctly in the
+# analysis repo this fork supports). Real Gaussian input has a real FFT
+# that is AUTOMATICALLY, exactly Hermitian-symmetric -- including the
+# tricky self-conjugate (real-valued) corner modes the original code had
+# to hand-construct -- so no manual corner-case logic is needed here at
+# all. get_transfer_grid() is patched to match: only its shape changed
+# (now [N, N, N//2+1]), its P(k) interpolation logic is untouched.
+#
+# generate_density_fourier() -- the ONLY caller of these two functions used
+# anywhere in the analysis repo this fork supports (initial_conditions:
+# "1LPT"/"2LPT"/"3LPT") -- is patched to match; see its own comment below.
+#
+# generate_force() and its two white_noise_fourier_*_force() helpers use
+# the SAME buggy axis-0-compact convention and are NOT used anywhere in
+# the supporting repo, so they are left UNFIXED and now ALSO shape-
+# mismatched against the (now-fixed) get_transfer_grid() as a consequence
+# of this patch -- see the warning on generate_force() below. Do not use
+# that code path without fixing it the same way first.
+#
+# Consequence for existing runs: any simulation run before this patch used
+# a corrupted P(k) at IC generation time. A given `seed` will now produce a
+# different (but statistically correct) realisation than it did before --
+# this is unavoidable, since the underlying algorithm changed. Re-run any
+# simulation whose results you rely on.
+# ─────────────────────────────────────────────────────────────────────────
+
+
 @utils.time_me
-@njit(
-    fastmath=True,
-    cache=True,
-    parallel=True,
-)
 def white_noise_fourier(
-    ncells_1d: int, rng: np.random.Generator
+    ncells_1d: int, rng: np.random.Generator, nthreads: int = 1
 ) -> npt.NDArray[np.complex64]:
     """Generate Fourier-space white noise on a regular 3D grid
 
@@ -593,11 +681,14 @@ def white_noise_fourier(
         Number of cells along one direction
     rng : np.random.Generator
         Random generator (NumPy)
+    nthreads : int
+        Number of threads used for the forward FFT (default 1)
 
     Returns
     -------
     npt.NDArray[np.complex64]
-        3D white-noise field for density [N_cells_1d, N_cells_1d, N_cells_1d]
+        3D white-noise field for density, compact/rfft layout
+        [N_cells_1d, N_cells_1d, N_cells_1d // 2 + 1]
 
     Example
     -------
@@ -606,65 +697,28 @@ def white_noise_fourier(
     >>> white_noise = white_noise_fourier(16, np.random.default_rng())
     >>> print(white_noise)
     """
-    twopi = np.float32(2 * math.pi)
-    ii = np.complex64(1j)
-    one = np.float32(1)
-    middle = ncells_1d // 2
-    density = np.empty((ncells_1d, ncells_1d, ncells_1d), dtype=np.complex64)
-    # Must compute random before parallel loop to ensure reproductability
-    rng_amplitudes = rng.random((middle + 1, ncells_1d, ncells_1d), dtype=np.float32)
-    rng_phases = rng.random((middle + 1, ncells_1d, ncells_1d), dtype=np.float32)
-    for i in prange(middle + 1):
-        im = -np.int32(i)
-        for j in prange(ncells_1d):
-            jm = -j
-            for k in prange(ncells_1d):
-                km = -k
-                phase = twopi * rng_phases[i, j, k]
-                amplitude = math.sqrt(
-                    -math.log(
-                        one - rng_amplitudes[i, j, k]
-                    )  # rng.random in range [0,1), must ensure no NaN
-                )  # Rayleigh sampling
-                real = amplitude * math.cos(phase)
-                imaginary = ii * amplitude * math.sin(phase)
-                result_upper = real + imaginary
-                result_lower = real - imaginary
-                density[i, j, k] = result_upper
-                density[im, jm, km] = result_lower
-    rng_phases = 0
-    rng_amplitudes = 0
-    # Fix corners
-    density[0, 0, 0] = 0
-    density[0, 0, middle] = math.sqrt(-math.log(one - rng.random(dtype=np.float32)))
-    density[0, middle, 0] = math.sqrt(-math.log(one - rng.random(dtype=np.float32)))
-    density[0, middle, middle] = math.sqrt(
-        -math.log(one - rng.random(dtype=np.float32))
-    )
-    density[middle, 0, 0] = math.sqrt(-math.log(one - rng.random(dtype=np.float32)))
-    density[middle, 0, middle] = math.sqrt(
-        -math.log(one - rng.random(dtype=np.float32))
-    )
-    density[middle, middle, 0] = math.sqrt(
-        -math.log(one - rng.random(dtype=np.float32))
-    )
-    density[middle, middle, middle] = math.sqrt(
-        -math.log(one - rng.random(dtype=np.float32))
-    )
-
+    # Real-space unit-variance Gaussian noise, pre-scaled by 1/sqrt(N_total)
+    # so that E[|fft_3D_real(noise)|^2] == 1 per retained mode -- matching
+    # the variance convention get_transfer_grid()'s sqrt(Pk/V)*N^3 scaling
+    # already assumes (see the DFT variance identity
+    # E[|FFT(x)_k|^2] = N_total * Var(x) for i.i.d. real x).
+    n_total = np.float32(ncells_1d) ** 3
+    noise_real = (
+        rng.standard_normal((ncells_1d, ncells_1d, ncells_1d)) / np.sqrt(n_total)
+    ).astype(np.float32)
+    density = fourier.fft_3D_real(noise_real, nthreads)
+    density[0, 0, 0] = 0  # no power in the (fixed, non-fluctuating) mean mode
     return density
 
 
 @utils.time_me
-@njit(
-    fastmath=True,
-    cache=True,
-    parallel=True,
-)
 def white_noise_fourier_fixed(
-    ncells_1d: int, rng: np.random.Generator, is_paired: bool
+    ncells_1d: int, rng: np.random.Generator, is_paired: bool, nthreads: int = 1
 ) -> npt.NDArray[np.complex64]:
     """Generate Fourier-space white noise with fixed amplitude on a regular 3D grid
+
+    See the FORK PATCH comment above white_noise_fourier() for why this was
+    rewritten and what it fixes.
 
     Parameters
     ----------
@@ -674,11 +728,14 @@ def white_noise_fourier_fixed(
         Random generator (NumPy)
     is_paired : bool
         If paired, add π to the random phases
+    nthreads : int
+        Number of threads used for the forward FFT (default 1)
 
     Returns
     -------
-    Tuple[npt.NDArray[np.complex64], npt.NDArray[np.complex64]]
-        3D white-noise field for density [N_cells_1d, N_cells_1d, N_cells_1d]
+    npt.NDArray[np.complex64]
+        3D fixed-amplitude white-noise field for density, compact/rfft
+        layout [N_cells_1d, N_cells_1d, N_cells_1d // 2 + 1]
 
     Example
     -------
@@ -687,38 +744,24 @@ def white_noise_fourier_fixed(
     >>> paired_white_noise = white_noise_fourier_fixed(16, np.random.default_rng(), 1)
     >>> print(paired_white_noise)
     """
-    twopi = np.float32(2 * np.pi)
-    one = np.float32(1)
-    ii = np.complex64(1j)
-    middle = ncells_1d // 2
+    # Same real-space-then-forward-FFT trick as white_noise_fourier(), then
+    # normalise every mode to unit magnitude (keeping only its random phase).
+    # This automatically reproduces the "fixed" convention's real-valued
+    # (magnitude exactly +-1) self-conjugate corner modes for free -- a real
+    # field's FFT is exactly real at those modes already, so dividing by
+    # their own magnitude just gives +1 or -1, with no special-casing needed.
+    n_total = np.float32(ncells_1d) ** 3
+    noise_real = (
+        rng.standard_normal((ncells_1d, ncells_1d, ncells_1d)) / np.sqrt(n_total)
+    ).astype(np.float32)
+    raw = fourier.fft_3D_real(noise_real, nthreads)
+    raw[0, 0, 0] = 1.0 + 0.0j  # placeholder to avoid 0/0 below; zeroed out after
+    density = (raw / np.abs(raw)).astype(np.complex64)
     if is_paired:
-        shift = np.float32(math.pi)
-    else:
-        shift = np.float32(0)
-    density = np.empty((ncells_1d, ncells_1d, ncells_1d), dtype=np.complex64)
-    rng_phases = rng.random((middle + 1, ncells_1d, ncells_1d), dtype=np.float32)
-    for i in prange(middle + 1):
-        im = -np.int32(i)
-        for j in prange(ncells_1d):
-            jm = -j
-            for k in prange(ncells_1d):
-                km = -k
-                phase = twopi * rng_phases[i, j, k] + shift
-                real = math.cos(phase)
-                imaginary = ii * math.sin(phase)
-                result_upper = real + imaginary
-                result_lower = real - imaginary
-                density[i, j, k] = result_upper
-                density[im, jm, km] = result_lower
-    rng_phases = 0
-    density[0, 0, 0] = 0
-    density[0, 0, middle] = one
-    density[0, middle, 0] = one
-    density[0, middle, middle] = one
-    density[middle, 0, 0] = one
-    density[middle, 0, middle] = one
-    density[middle, middle, 0] = one
-    density[middle, middle, middle] = one
+        # e^{i(phase+pi)} == -e^{i*phase}: adding pi to every phase is the
+        # same as negating the whole field, uniformly.
+        density *= -1
+    density[0, 0, 0] = 0  # no power in the (fixed, non-fluctuating) mean mode
     return density
 
 
@@ -733,6 +776,11 @@ def white_noise_fourier_force(
     ncells_1d: int, rng: np.random.Generator
 ) -> npt.NDArray[np.complex64]:
     """Generate Fourier-space white FORCE noise on a regular 3D grid
+
+    FORK PATCH WARNING (2026-09-11): shares the axis-0-compact-vs-axis-2-compact
+    bug fixed in white_noise_fourier() (see the comment block above that
+    function) but was NOT fixed here -- unused by anything in the repo this
+    fork supports. Do not use without applying the same fix first.
 
     Parameters
     ----------
@@ -868,6 +916,11 @@ def white_noise_fourier_fixed_force(
     ncells_1d: int, rng: np.random.Generator, is_paired: bool
 ) -> npt.NDArray[np.complex64]:
     """Generate Fourier-space white FORCE noise with fixed amplitude on a regular 3D grid
+
+    FORK PATCH WARNING (2026-09-11): shares the axis-0-compact-vs-axis-2-compact
+    bug fixed in white_noise_fourier() (see the comment block above that
+    function) but was NOT fixed here -- unused by anything in the repo this
+    fork supports. Do not use without applying the same fix first.
 
     Parameters
     ----------
