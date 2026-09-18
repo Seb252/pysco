@@ -203,6 +203,51 @@ def generate(
             return position, velocity
         else:
             raise ValueError(f"{INITIAL_CONDITIONS=}, should be 1LPT, 2LPT or 3LPT")
+    elif INITIAL_CONDITIONS.casefold() == "tophat":
+        # FORK ADDITION (Seb252/pysco): deterministic spherical top-hat IC,
+        # for spherical-collapse validation against analytic solutions
+        # (e.g. Gunn & Gott 1972) -- an alternative to the "1LPT" branch's
+        # power-spectrum-drawn random field. Reuses every other piece of the
+        # "1LPT" branch above unchanged (Poisson solve, gradient, Zel'dovich
+        # displacement, finalise_initial_conditions) -- only where the
+        # Fourier-space density field comes from differs. Previously done
+        # from the *analysis* repo by monkeypatching generate_density_fourier
+        # at runtime (src/spherical_collapse.py's install_tophat_ic); this is
+        # the same technique made a first-class, native IC option instead, so
+        # it needs no per-session patching and works unmodified on any
+        # machine running this fork (e.g. a supercomputer).
+        #
+        # New param keys (set directly, e.g. param["tophat_radius_mpch"] = 1.5):
+        #   tophat_radius_mpch  : float -- comoving sphere radius [Mpc/h]
+        #   tophat_center       : (float, float, float) in (0,1) box units,
+        #                         default (0.5, 0.5, 0.5) -- box centre
+        #   tophat_delta_zstart : float -- target LINEAR density contrast the
+        #                         sphere should have AT z_start (i.e. AFTER
+        #                         1LPT's dplus_1 growth is applied below) --
+        #                         the physically meaningful, literature-
+        #                         comparable quantity (c.f. Gunn & Gott's
+        #                         Delta_i).
+        a_start = 1.0 / (1 + param["z_start"])
+        lna_start = np.log(a_start)
+        Hz = tables[2](lna_start)
+        mpc_to_km = 1e3 * pc.value
+        Hz *= param["unit_t"] / mpc_to_km
+
+        dplus_1_z0 = tables[3](0)
+        dplus_1 = np.float32(tables[3](lna_start) / dplus_1_z0)
+        f1 = tables[4](lna_start)
+        fH_1 = np.float32(f1 * Hz)
+
+        density_fourier = generate_tophat_density_fourier(param, dplus_1)
+        fourier.inverse_laplacian(density_fourier)
+        psi_1lpt_fourier = fourier.gradient(density_fourier)
+        psi_1lpt = fourier.ifft_3D_real_grad(psi_1lpt_fourier, param["nthreads"])
+
+        position, velocity = initialise_1LPT(psi_1lpt, dplus_1, fH_1, param)
+        position = position.reshape(param["npart"], 3)
+        velocity = velocity.reshape(param["npart"], 3)
+        finalise_initial_conditions(position, velocity, param, do_reorder=False)
+        return position, velocity
     elif INITIAL_CONDITIONS[-3:].casefold() == ".h5".casefold():
         position, velocity = read_hdf5(param)
         finalise_initial_conditions(position, velocity, param, do_reorder=True)
@@ -447,6 +492,70 @@ def generate_density_fourier(param: pd.Series) -> npt.NDArray[np.complex64]:
     utils.prod_vector_vector_inplace(density_k, transfer_grid)
     transfer_grid = 0
     return density_k
+
+
+def generate_tophat_density_fourier(
+    param: pd.Series, dplus_1: np.float32
+) -> npt.NDArray[np.complex64]:
+    """Build a deterministic spherical top-hat density field (Fourier-space)
+
+    FORK ADDITION (Seb252/pysco). Alternative to generate_density_fourier()
+    for spherical-collapse validation: instead of drawing a random field
+    from a power spectrum, paints a single uniform-overdensity sphere at
+    param["tophat_center"] with radius param["tophat_radius_mpch"], using
+    periodic (minimum-image) distance so the sphere can sit anywhere in the
+    box without being cut by the boundary. Selected via
+    param["initial_conditions"] = "tophat"; see the comment in generate()'s
+    "tophat" branch for the full story and the new param keys.
+
+    Parameters
+    ----------
+    param : pd.Series
+        Parameter container -- needs npart, boxlen, nthreads, and the
+        tophat_radius_mpch / tophat_delta_zstart / (optional) tophat_center
+        keys described in generate()'s "tophat" branch.
+    dplus_1 : np.float32
+        Linear growth factor D+(z_start)/D+(0) -- generate()'s "tophat"
+        branch computes this from `tables` (before calling here) and passes
+        it in, since this function has no access to `tables` itself.
+
+    Returns
+    -------
+    npt.NDArray[np.complex64]
+        Fourier-space density field, compact/rfft layout [N, N, N//2+1]
+        (fourier.fft_3D_real()'s own output shape).
+
+    Example
+    -------
+    >>> import pandas as pd
+    >>> import numpy as np
+    >>> from pysco.initial_conditions import generate_tophat_density_fourier
+    >>> param = pd.Series({
+    ...     'npart': 32**3, 'boxlen': 4.0, 'nthreads': 1,
+    ...     'tophat_radius_mpch': 1.5, 'tophat_delta_zstart': 0.03,
+    ... })
+    >>> generate_tophat_density_fourier(param, np.float32(0.03))
+    """
+    ncells_1d = int(math.cbrt(param["npart"]))
+    R_frac = param["tophat_radius_mpch"] / param["boxlen"]
+    center = param.get("tophat_center", (0.5, 0.5, 0.5))
+
+    coords = (np.arange(ncells_1d) + 0.5) / ncells_1d  # cell centres, box units [0,1)
+    X, Y, Z = np.meshgrid(coords, coords, coords, indexing="ij")
+    dx = (X - center[0] + 0.5) % 1.0 - 0.5
+    dy = (Y - center[1] + 0.5) % 1.0 - 0.5
+    dz = (Z - center[2] + 0.5) % 1.0 - 0.5
+    r = np.sqrt(dx * dx + dy * dy + dz * dz)
+
+    # 1LPT (in generate()'s "tophat" branch, after this returns) grows this
+    # field by dplus_1 between z=0-equivalent and z_start, so pre-divide to
+    # land exactly on tophat_delta_zstart once grown -- same convention
+    # generate_density_fourier()'s power-spectrum field already relies on
+    # (it's z=0-normalised; growth-down happens later in initialise_1LPT).
+    delta_amp_raw = np.float32(param["tophat_delta_zstart"]) / dplus_1
+    density_raw = np.where(r <= R_frac, delta_amp_raw, 0.0).astype(np.float32)
+
+    return fourier.fft_3D_real(density_raw, param["nthreads"])
 
 
 @utils.time_me
