@@ -429,6 +429,10 @@ def rhs_poisson(
         match MOND_FUNCTION:
             case "simple":
                 mond.rhs_simple(additional_field, density, g0)
+            # FORK ADDITION: exact deep-MOND nu(y) = y^(-1/2) at ALL accelerations
+            # (no Newtonian limit). Validation-only -- see pysco/mond.py:nu_deep.
+            case "deep":
+                mond.rhs_deep(additional_field, density, g0)
             case "n":
                 mond.rhs_n(additional_field, density, g0, n=alpha)
             case "beta":
@@ -439,7 +443,7 @@ def rhs_poisson(
                 mond.rhs_delta(additional_field, density, g0, delta=alpha)
             case _:
                 raise NotImplementedError(
-                    f"{MOND_FUNCTION=}, should be 'simple', 'n', 'beta', 'gamma' or 'delta'"
+                    f"{MOND_FUNCTION=}, should be 'simple', 'deep', 'n', 'beta', 'gamma' or 'delta'"
                 )
     else:
         f1 = np.float32(

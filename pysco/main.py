@@ -85,7 +85,8 @@ def run(param) -> None:
     elif extra.casefold() == "mond".casefold():
         mond_function = param["mond_function"].casefold()
         extra += f"_g0_{param['mond_g0']}_exponent_{param['mond_scale_factor_exponent']}_{mond_function}"
-        if "simple".casefold() != mond_function:
+        # FORK: "deep" (exact deep-MOND nu) takes no mond_alpha, same as "simple"
+        if mond_function not in ("simple".casefold(), "deep".casefold()):
             extra += f"_{param['mond_alpha']}"
     elif extra.casefold() == "parametrized".casefold():
         extra += f"_mu0_{param['parametrized_mu0']}"

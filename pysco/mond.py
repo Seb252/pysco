@@ -930,3 +930,233 @@ def rhs_delta(
                     + nu_Bz * f_Bz_z
                     - nu_Az * f_Az_z
                 )
+
+
+# ---------------------------------------------------------------------------
+# FORK ADDITION -- exact deep-MOND interpolating function
+# ---------------------------------------------------------------------------
+# Not in upstream pysco. The five upstream families (simple/n/beta/gamma/delta)
+# are *interpolating* functions: nu(y) -> 1 for y >> 1 (Newtonian) and only
+# approach the deep-MOND power law nu(y) -> y^(-1/2) as y -> 0. That makes
+# "deep MOND" a limit you sneak up on by pushing y = |grad phi|/g0 down, and it
+# leaves a residual systematic (~sqrt(y)/2 for "simple", ~y/4 for "delta").
+#
+# For validating the solver against an analytic deep-MOND derivation you want
+# the simulation to solve *exactly* the equation the derivation assumes, with
+# no interpolation systematic at any acceleration scale. nu_deep below is that:
+# nu(y) = y^(-1/2) for all y, i.e. g = sqrt(g_N * g0) everywhere. It is NOT a
+# physical MOND interpolating function (it never returns to Newtonian gravity
+# at high acceleration) and must not be used for production cosmology -- it
+# exists purely as a validation target. Select it with
+#     param["mond_function"] = "deep"
+# ("deep" takes no mond_alpha, exactly like "simple".)
+
+
+@njit(["f4(f4)"], fastmath=True, cache=True)
+def nu_deep(y: np.float32) -> np.float32:
+    """
+    Exact deep-MOND "interpolating" function (FORK ADDITION, not upstream).
+
+    nu(y) = y^(-1/2) at every y, so that g = nu(g_N/g0) * g_N = sqrt(g_N * g0)
+    at all acceleration scales. Unlike the simple/n/beta/gamma/delta families
+    this does NOT tend to 1 at large y -- there is no Newtonian regime. Use it
+    only to validate against an analytic deep-MOND solution.
+
+    Zero-gradient guard
+    -------------------
+    nu diverges as y -> 0, and numba's default error_model is "python", so a
+    cell whose Newtonian gradient is exactly zero would raise ZeroDivisionError
+    and kill the run. The quantity actually used by rhs_deep is the product
+    nu(|f|/g0) * f_i, and since |f_i| <= |f|,
+
+        nu * f_i = sqrt(g0/|f|) * f_i  ->  0   as |f| -> 0,
+
+    so returning 0 is the correct limit, not a fudge. The cut is applied at
+    y < 1e-30 rather than y <= 0 to also avoid 1/sqrt(y) overflowing float32
+    (which happens for y < ~8.6e-78); a term dropped at that threshold
+    contributes < 1e-15 * sqrt(g0) and is far below float32 round-off on the
+    surviving terms.
+
+    Parameters
+    ----------
+    y : np.float32
+        Argument, |grad phi| / g0
+
+    Returns
+    -------
+    np.float32
+        Nu function, y^(-1/2) (0 if y is zero/denormal)
+
+    Examples
+    --------
+    >>> from pysco.mond import nu_deep
+    >>> nu_deep(np.float32(1e-4))   # -> 100.0
+    """
+    tiny = np.float32(1e-30)
+    if y < tiny:
+        return np.float32(0)
+    return np.float32(1.0) / math.sqrt(y)
+
+
+@njit(
+    ["void(f4[:,:,::1], f4[:,:,::1], f4)"],
+    fastmath=True,
+    cache=True,
+    parallel=True,
+)
+def rhs_deep(
+    potential: npt.NDArray[np.float32], out: npt.NDArray[np.float32], g0: np.float32
+) -> None:
+    """
+    Right-hand side of the QUMOND Poisson equation using the EXACT deep-MOND
+    nu function (FORK ADDITION, not upstream).
+
+    Identical to rhs_simple() -- same Lughausen et al. (2014) A/B staggered
+    stencil, same discretisation -- except that nu_simple is replaced by
+    nu_deep, i.e. nu(y) = y^(-1/2) at every acceleration rather than an
+    interpolating function that returns to Newtonian gravity at large y.
+    This makes the solver reproduce g = sqrt(g_N * g0) exactly, which is what
+    an analytic deep-MOND derivation assumes -- use it for validation runs,
+    not for production cosmology.
+
+    Select it from a param dict with param["mond_function"] = "deep".
+
+    Parameters
+    ----------
+    potential : npt.NDArray[np.float32]
+        Newtonian Potential field [N, N, N]
+    out : npt.NDArray[np.float32]
+        Output array [N, N, N]
+    g0 : np.float32
+        Acceleration constant
+
+    Examples
+    --------
+    >>> from pysco.mond import rhs_deep
+    >>> phi = np.random.rand(32, 32, 32).astype(np.float32)
+    >>> out = np.empty_like(phi)
+    >>> rhs_deep(phi, out, 0.5)
+    """
+    inv_g0 = np.float32(1.0 / g0)
+    ncells_1d = len(potential)
+    invh = np.float32(ncells_1d)
+    inv4h = np.float32(0.25 * ncells_1d)
+
+    for i in prange(-1, ncells_1d - 1):
+        im1 = i - 1
+        ip1 = i + 1
+        for j in prange(-1, ncells_1d - 1):
+            jm1 = j - 1
+            jp1 = j + 1
+            for k in prange(-1, ncells_1d - 1):
+                km1 = k - 1
+                kp1 = k + 1
+
+                potential_000 = potential[i, j, k]
+                # Point A at -h/2, Point B at +h/2 (same convention as Lüghausen et al. 2014)
+                # Ax
+                f_Ax_x = invh * (potential_000 - potential[im1, j, k])
+                f_Ax_y = inv4h * (
+                    potential[i, jp1, k]
+                    - potential[i, jm1, k]
+                    + potential[im1, jp1, k]
+                    - potential[im1, jm1, k]
+                )
+                f_Ax_z = inv4h * (
+                    potential[i, j, kp1]
+                    - potential[i, j, km1]
+                    + potential[im1, j, kp1]
+                    - potential[im1, j, km1]
+                )
+                f_Ax = math.sqrt(f_Ax_x**2 + f_Ax_y**2 + f_Ax_z**2)
+                # Bx
+                f_Bx_x = invh * (-potential_000 + potential[ip1, j, k])
+                f_Bx_y = inv4h * (
+                    potential[ip1, jp1, k]
+                    - potential[ip1, jm1, k]
+                    + potential[i, jp1, k]
+                    - potential[i, jm1, k]
+                )
+                f_Bx_z = inv4h * (
+                    potential[ip1, j, kp1]
+                    - potential[ip1, j, km1]
+                    + potential[i, j, kp1]
+                    - potential[i, j, km1]
+                )
+                f_Bx = math.sqrt(f_Bx_x**2 + f_Bx_y**2 + f_Bx_z**2)
+                # Ay
+                f_Ay_y = invh * (potential_000 - potential[i, jm1, k])
+                f_Ay_x = inv4h * (
+                    potential[ip1, j, k]
+                    - potential[im1, j, k]
+                    + potential[ip1, jm1, k]
+                    - potential[im1, jm1, k]
+                )
+                f_Ay_z = inv4h * (
+                    potential[i, j, kp1]
+                    - potential[i, j, km1]
+                    + potential[i, jm1, kp1]
+                    - potential[i, jm1, km1]
+                )
+                f_Ay = math.sqrt(f_Ay_x**2 + f_Ay_y**2 + f_Ay_z**2)
+                # By
+                f_By_y = invh * (-potential_000 + potential[i, jp1, k])
+                f_By_x = inv4h * (
+                    potential[ip1, jp1, k]
+                    - potential[im1, jp1, k]
+                    + potential[ip1, j, k]
+                    - potential[im1, j, k]
+                )
+                f_By_z = inv4h * (
+                    potential[i, jp1, kp1]
+                    - potential[i, jp1, km1]
+                    + potential[i, j, kp1]
+                    - potential[i, j, km1]
+                )
+                f_By = math.sqrt(f_By_x**2 + f_By_y**2 + f_By_z**2)
+                # Az
+                f_Az_z = invh * (potential_000 - potential[i, j, km1])
+                f_Az_x = inv4h * (
+                    potential[ip1, j, k]
+                    - potential[im1, j, k]
+                    + potential[ip1, j, km1]
+                    - potential[im1, j, km1]
+                )
+                f_Az_y = inv4h * (
+                    potential[i, jp1, k]
+                    - potential[i, jm1, k]
+                    + potential[i, jp1, km1]
+                    - potential[i, jm1, km1]
+                )
+                f_Az = math.sqrt(f_Az_x**2 + f_Az_y**2 + f_Az_z**2)
+                # Bz
+                f_Bz_z = invh * (-potential_000 + potential[i, j, kp1])
+                f_Bz_x = inv4h * (
+                    potential[ip1, j, kp1]
+                    - potential[im1, j, kp1]
+                    + potential[ip1, j, k]
+                    - potential[im1, j, k]
+                )
+                f_Bz_y = inv4h * (
+                    potential[i, jp1, kp1]
+                    - potential[i, jm1, kp1]
+                    + potential[i, jp1, k]
+                    - potential[i, jm1, k]
+                )
+                f_Bz = math.sqrt(f_Bz_x**2 + f_Bz_y**2 + f_Bz_z**2)
+
+                nu_Ax = nu_deep(f_Ax * inv_g0)
+                nu_Ay = nu_deep(f_Ay * inv_g0)
+                nu_Az = nu_deep(f_Az * inv_g0)
+                nu_Bx = nu_deep(f_Bx * inv_g0)
+                nu_By = nu_deep(f_By * inv_g0)
+                nu_Bz = nu_deep(f_Bz * inv_g0)
+
+                out[i, j, k] = invh * (
+                    nu_Bx * f_Bx_x
+                    - nu_Ax * f_Ax_x
+                    + nu_By * f_By_y
+                    - nu_Ay * f_Ay_y
+                    + nu_Bz * f_Bz_z
+                    - nu_Az * f_Az_z
+                )
