@@ -114,7 +114,20 @@ def generate(
         Hz *= param["unit_t"] / mpc_to_km  # km/s/Mpc to BU
         # psi_1lpt = generate_force(param)
 
-        density_fourier = generate_density_fourier(param)
+        # FORK ADDITION: optional per-mode velocities (e.g. from CAMB) instead of
+        # the growing mode -- see generate_density_and_velocity_fourier().
+        velocity_file = param.get("velocity_file", "")
+        use_velocity_file = isinstance(velocity_file, str) and velocity_file != ""
+        if use_velocity_file:
+            if INITIAL_CONDITIONS.casefold() != "1LPT".casefold():
+                raise NotImplementedError(
+                    f"velocity_file is only supported with 1LPT, not {INITIAL_CONDITIONS}: "
+                    "the 2LPT/3LPT velocity terms assume every mode is in the growing mode"
+                )
+            logging.warning(f"1LPT velocities from {velocity_file} (not growing mode)")
+            density_fourier, delta_dot_fourier = generate_density_and_velocity_fourier(param)
+        else:
+            density_fourier = generate_density_fourier(param)
 
         fourier.inverse_laplacian(density_fourier)
         potential_1_fourier = density_fourier
@@ -130,6 +143,19 @@ def generate(
         fH_1 = np.float32(f1 * Hz)
         position, velocity = initialise_1LPT(psi_1lpt, dplus_1, fH_1, param)
         psi_1lpt = 0
+        if use_velocity_file:
+            # Build a displacement from d(delta)/dln(a) exactly as psi is built from
+            # delta, then v = D+ * H * psi_v. The file already carries the growth
+            # rate per mode (V = f * sqrt(P) for a growing mode), so H replaces f*H.
+            # Going through initialise_1LPT keeps its sign convention and the
+            # center/edge particle layout identical to the position field.
+            fourier.inverse_laplacian(delta_dot_fourier)
+            psi_v_fourier = fourier.gradient(delta_dot_fourier)
+            delta_dot_fourier = 0
+            psi_v = fourier.ifft_3D_real_grad(psi_v_fourier, param["nthreads"])
+            psi_v_fourier = 0
+            _, velocity = initialise_1LPT(psi_v, dplus_1, np.float32(Hz), param)
+            psi_v = 0
         if INITIAL_CONDITIONS.casefold() == "1LPT".casefold():
             position = position.reshape(param["npart"], 3)
             velocity = velocity.reshape(param["npart"], 3)
@@ -472,7 +498,20 @@ def generate_density_fourier(param: pd.Series) -> npt.NDArray[np.complex64]:
     >>> generate_density_fourier(param)
     """
     transfer_grid = get_transfer_grid(param)
+    density_k = generate_white_noise_fourier(param)
+    utils.prod_vector_vector_inplace(density_k, transfer_grid)
+    transfer_grid = 0
+    return density_k
 
+
+def generate_white_noise_fourier(param: pd.Series) -> npt.NDArray[np.complex64]:
+    """Unit white noise in Fourier space, compact rfft layout [N, N, N // 2 + 1].
+
+    FORK: split out of generate_density_fourier() (same RNG calls in the same
+    order, so a given seed still gives the identical density field) so that
+    generate_density_and_velocity_fourier() can colour ONE noise realisation
+    with two different transfer grids.
+    """
     ncells_1d = int(math.cbrt(param["npart"]))
     seed = param["seed"]
     if seed < 0:
@@ -483,15 +522,40 @@ def generate_density_fourier(param: pd.Series) -> npt.NDArray[np.complex64]:
     # FORK PATCH: nthreads now passed through -- white_noise_fourier[_fixed]()
     # need it for their internal forward FFT (fft_3D_real) since the fix.
     if param["fixed_ICS"]:
-        density_k = white_noise_fourier_fixed(
+        return white_noise_fourier_fixed(
             ncells_1d, rng, param["paired_ICS"], param["nthreads"]
         )
-    else:
-        density_k = white_noise_fourier(ncells_1d, rng, param["nthreads"])
+    return white_noise_fourier(ncells_1d, rng, param["nthreads"])
 
-    utils.prod_vector_vector_inplace(density_k, transfer_grid)
-    transfer_grid = 0
-    return density_k
+
+def generate_density_and_velocity_fourier(
+    param: pd.Series,
+) -> Tuple[npt.NDArray[np.complex64], npt.NDArray[np.complex64]]:
+    """Density field and density-growth-rate field from ONE noise realisation.
+
+    FORK ADDITION. Standard 1LPT gives every mode the growing-mode velocity
+    v = D+ f H psi, with a single growth rate f for all scales. That fails when
+    modes are not in the growing mode at z_start -- e.g. baryons just after
+    recombination, still moving with their acoustic oscillations: at a
+    trough of P(k) delta ~ 0 while the velocity is at its maximum.
+
+    Here the same white noise is coloured twice:
+      delta_k      = noise * sqrt(P(k))   from param["power_spectrum_file"]
+      delta_dot_k  = noise * V(k)         from param["velocity_file"]
+    where V(k) is the SIGNED amplitude of d(delta)/dln(a) per mode (see
+    PySCo_helper.save_velocity_file). Velocities are then built from
+    delta_dot_k exactly as positions are built from delta_k. If V = f*sqrt(P)
+    this reproduces standard growing-mode 1LPT exactly.
+
+    Returns
+    -------
+    density_k, delta_dot_k : compact rfft layout [N, N, N // 2 + 1]
+    """
+    noise = generate_white_noise_fourier(param)
+    delta_dot_k = noise.copy()
+    utils.prod_vector_vector_inplace(noise, get_transfer_grid(param))
+    utils.prod_vector_vector_inplace(delta_dot_k, get_velocity_transfer_grid(param))
+    return noise, delta_dot_k
 
 
 def generate_tophat_density_fourier(
@@ -681,13 +745,32 @@ def get_transfer_grid(param: pd.Series) -> npt.NDArray[np.float32]:
     >>> get_transfer_grid(param)
     """
     k, Pk = np.loadtxt(param["power_spectrum_file"]).T
+    return amplitude_on_grid(param, k, np.sqrt(Pk))
 
+
+def get_velocity_transfer_grid(param: pd.Series) -> npt.NDArray[np.float32]:
+    """Signed d(delta)/dln(a) amplitude V(k) on the 3D grid (FORK ADDITION).
+
+    Reads param["velocity_file"]: two columns k [h/Mpc] and V(k) [(Mpc/h)^1.5],
+    '#' header lines allowed. Normalised exactly like sqrt(P(k)) in
+    get_transfer_grid(), so V = f * sqrt(P) reproduces growing-mode 1LPT.
+    """
+    k, V = np.loadtxt(param["velocity_file"], comments="#").T
+    return amplitude_on_grid(param, k, V)
+
+
+def amplitude_on_grid(
+    param: pd.Series, k: npt.NDArray, amplitude: npt.NDArray
+) -> npt.NDArray[np.float32]:
+    """Interpolate a mode amplitude A(k) [(Mpc/h)^1.5] onto the compact rfft grid,
+    in the discrete normalisation pysco's white noise expects (A / sqrt(V_box) * N^3).
+    A may be signed. FORK: split out of get_transfer_grid(), logic unchanged."""
     ncells_1d = int(math.cbrt(param["npart"]))
     if param["npart"] != ncells_1d**3:
         raise ValueError(f"{math.cbrt(param['npart'])=}, should be integer")
     kf = 2 * np.pi / param["boxlen"]
     k_dimensionless = k / kf
-    sqrtPk = (np.sqrt(Pk / param["boxlen"] ** 3) * ncells_1d**3).astype(np.float32)
+    sqrtPk = (amplitude / np.sqrt(param["boxlen"] ** 3) * ncells_1d**3).astype(np.float32)
     k_1d = np.fft.fftfreq(ncells_1d, 1 / ncells_1d)
     # FORK PATCH: last axis compacted to [0, ncells_1d//2] to match the
     # rfft-style [N, N, N//2+1] layout white_noise_fourier() now produces
