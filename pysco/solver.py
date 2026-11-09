@@ -33,6 +33,7 @@ def pm(
     potential: npt.NDArray[np.float32] = np.empty(0, dtype=np.float32),
     additional_field: npt.NDArray[np.float32] = np.empty(0, dtype=np.float32),
     tables: List[interp1d] = [],
+    mass: npt.NDArray[np.float32] = np.empty(0, dtype=np.float32),
 ) -> Tuple[npt.NDArray[np.float32], npt.NDArray[np.float32], npt.NDArray[np.float32]]:
     """Compute Particle-Mesh acceleration
 
@@ -80,9 +81,14 @@ def pm(
     match MASS_SCHEME:
         case "cic":
             param["MAS_index"] = 2
-            density = mesh.CIC(position, ncells_1d)
+            if mass.size:  # FORK: two species, see species.py
+                density = mesh.CIC_weighted(position, mass, ncells_1d)
+            else:
+                density = mesh.CIC(position, ncells_1d)
         case "tsc":
             param["MAS_index"] = 3
+            if mass.size:
+                raise NotImplementedError("two species need mass_scheme = CIC")
             if param["nthreads"] >= 4:
                 density = mesh.TSC(position, ncells_1d)
             else:

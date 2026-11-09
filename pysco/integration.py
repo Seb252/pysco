@@ -23,6 +23,7 @@ def integrate(
     tables: List[interp1d],
     param: pd.Series,
     t_snap_next: np.float32 = np.float32(0),
+    mass: npt.NDArray[np.float32] = np.empty(0, dtype=np.float32),
 ) -> Tuple[
     npt.NDArray[np.float32],
     npt.NDArray[np.float32],
@@ -50,6 +51,8 @@ def integrate(
         Parameter container
     t_snap_next : np.float32
         Time at next snapshot, by default np.float32(0)
+    mass : npt.NDArray[np.float32]
+        Particle masses relative to the mean [N_part], by default empty: all equal
 
     Returns
     -------
@@ -102,6 +105,7 @@ def integrate(
                 dt,
                 tables,
                 param,
+                mass,
             )
         case "euler":
             return euler(
@@ -113,6 +117,7 @@ def integrate(
                 dt,
                 tables,
                 param,
+                mass,
             )
         case _:
             raise NotImplementedError("ERROR: Integrator must be 'leapfrog' or 'euler'")
@@ -127,6 +132,7 @@ def euler(
     dt: np.float32,
     tables: List[interp1d],
     param: pd.Series,
+    mass: npt.NDArray[np.float32] = np.empty(0, dtype=np.float32),
 ) -> Tuple[
     npt.NDArray[np.float32],
     npt.NDArray[np.float32],
@@ -184,7 +190,7 @@ def euler(
     utils.periodic_wrap(position)
     utils.add_vector_scalar_inplace(velocity, acceleration, -dt)
     acceleration, potential, additional_field = solver.pm(
-        position, param, potential, additional_field, tables
+        position, param, potential, additional_field, tables, mass
     )
     return (position, velocity, acceleration, potential, additional_field)
 
@@ -198,6 +204,7 @@ def leapfrog(
     dt: np.float32,
     tables: List[interp1d],
     param: pd.Series,
+    mass: npt.NDArray[np.float32] = np.empty(0, dtype=np.float32),
 ) -> Tuple[
     npt.NDArray[np.float32],
     npt.NDArray[np.float32],
@@ -257,7 +264,7 @@ def leapfrog(
     utils.set_units(param)
     utils.periodic_wrap(position)
     acceleration, potential, additional_field = solver.pm(
-        position, param, potential, additional_field, tables
+        position, param, potential, additional_field, tables, mass
     )
     utils.add_vector_scalar_inplace(velocity, acceleration, -half_dt)
 

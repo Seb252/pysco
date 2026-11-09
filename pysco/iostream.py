@@ -137,6 +137,7 @@ def write_snapshot_particles(
     position: npt.NDArray[np.float32],
     velocity: npt.NDArray[np.float32],
     param: pd.Series,
+    mass: npt.NDArray[np.float32] = np.empty(0, dtype=np.float32),
 ) -> None:
     """Write snapshot with particle information in HDF5 or Parquet format
 
@@ -148,6 +149,8 @@ def write_snapshot_particles(
         Velocity [N_part, 3]
     param : pd.Series
         Parameter container
+    mass : npt.NDArray[np.float32]
+        Relative particle masses [N_part], HDF5 only, by default empty: not written
 
     Examples
     --------
@@ -175,7 +178,7 @@ def write_snapshot_particles(
             logging.warning(f"Parameter file written at ...{param_filename=}")
         case "hdf5":
             filename = f"{param['base']}/output_{param['i_snap']:05d}/particles_{param['extra']}.h5"
-            write_snapshot_particles_hdf5(filename, position, velocity, param)
+            write_snapshot_particles_hdf5(filename, position, velocity, param, mass)
         case _:
             raise NotImplementedError(
                 f"{param['snapshot_format']=}, should be 'parquet' or 'hdf5'"
@@ -232,6 +235,7 @@ def write_snapshot_particles_hdf5(
     position: npt.NDArray[np.float32],
     velocity: npt.NDArray[np.float32],
     param: pd.Series,
+    mass: npt.NDArray[np.float32] = np.empty(0, dtype=np.float32),
 ) -> None:
     """Write snapshot with particle information in HDF5 format
 
@@ -245,6 +249,8 @@ def write_snapshot_particles_hdf5(
         Velocity [N_part, 3]
     param : pd.Series
         Parameter container
+    mass : npt.NDArray[np.float32]
+        Relative particle masses [N_part], by default empty: not written
 
     Examples
     --------
@@ -261,6 +267,8 @@ def write_snapshot_particles_hdf5(
     with h5py.File(filename, "w") as h5f:
         h5f.create_dataset("position", data=position)
         h5f.create_dataset("velocity", data=velocity)
+        if mass.size:
+            h5f.create_dataset("mass", data=mass)
         for key, item in param.items():
             h5f.attrs[key] = item
 

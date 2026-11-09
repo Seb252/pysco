@@ -23,6 +23,7 @@ import pandas as pd
 import logging
 from rich.logging import RichHandler
 import iostream
+import species
 from time import perf_counter
 import sys
 
@@ -91,6 +92,10 @@ def run(param) -> None:
     elif extra.casefold() == "parametrized".casefold():
         extra += f"_mu0_{param['parametrized_mu0']}"
     extra += f"_{param['linear_newton_solver']}_ncoarse{param['ncoarse']}"
+    if param.get("baryon_fraction", 0.0) > 0:  # FORK: two species, see species.py
+        extra += f"_fb{param['baryon_fraction']:g}"
+    if "nu_density_file" in param:             # FORK: each species its own spectrum
+        extra += "_sp"
     param["extra"] = extra
     z_out = ast.literal_eval(param["z_out"])
 
@@ -111,10 +116,15 @@ def run(param) -> None:
         param["nsteps"] = 0
     logging.warning(f"\n[bold blue]----- Initial conditions -----[/bold blue]\n")
     position, velocity = initial_conditions.generate(param, tables)
+    mass = species.relative_masses(param)  # empty for one species
+    if mass.size and mass.size != len(position):
+        raise ValueError(f"{mass.size=} masses for {len(position)=} particles")
     param["t"] = tables[1](np.log(param["aexp"]))
     logging.warning(f"{param['aexp']=} {param['t']=}")
     logging.warning(f"\n[bold blue]----- Run N-body -----[/bold blue]\n")
-    acceleration, potential, additional_field = solver.pm(position, param)
+    acceleration, potential, additional_field = solver.pm(
+        position, param, mass=mass
+    )
     aexp_out = 1.0 / (np.array(z_out) + 1)
     aexp_out.sort()
     t_out = tables[1](np.log(aexp_out))
@@ -142,15 +152,21 @@ def run(param) -> None:
             tables,
             param,
             t_out[param["i_snap"] - 1],
+            mass,
         )  # Put None instead of potential if you do not want to use previous step
 
         if (param["nsteps"] % param["n_reorder"]) == 0:
             logging.info("Reordering particles")
-            position, velocity, acceleration = utils.reorder_particles(
-                position, velocity, acceleration
-            )
+            if mass.size:
+                position, velocity, acceleration, mass = utils.reorder_particles(
+                    position, velocity, acceleration, mass
+                )
+            else:
+                position, velocity, acceleration = utils.reorder_particles(
+                    position, velocity, acceleration
+                )
         if param["write_snapshot"]:
-            iostream.write_snapshot_particles(position, velocity, param)
+            iostream.write_snapshot_particles(position, velocity, param, mass)
             param["i_snap"] += 1
         logging.warning(
             f"{param['nsteps']=} {param['aexp']=} z = {1.0 / param['aexp'] - 1}"

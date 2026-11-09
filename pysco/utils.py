@@ -1020,6 +1020,7 @@ def reorder_particles(
     position: npt.NDArray[np.float32],
     velocity: npt.NDArray[np.float32] = None,
     acceleration: npt.NDArray[np.float32] = None,
+    mass: npt.NDArray[np.float32] = None,
 ):
     """Reorder particles inplace with Morton indices
 
@@ -1031,6 +1032,8 @@ def reorder_particles(
         Velocity [N_part, 3]
     acceleration : npt.NDArray[np.float32], optional
         Acceleration [N_part, 3], by default None
+    mass : npt.NDArray[np.float32], optional
+        Relative particle masses [N_part], reordered too if given, by default None
 
     Returns
     -------
@@ -1066,6 +1069,8 @@ def reorder_particles(
         # position[:] = position[arg, :]
         # velocity[:] = velocity[arg, :]
         # acceleration[:] = acceleration[arg, :]
+        if mass is not None:
+            return position, velocity, acceleration, injection_with_indices(arg, mass)
         return position, velocity, acceleration
     elif velocity is not None:
         position = injection_with_indices(arg, position)

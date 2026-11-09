@@ -19,6 +19,7 @@ import utils
 from astropy.constants import pc
 import logging
 import iostream
+import species
 import fourier
 
 
@@ -114,6 +115,21 @@ def generate(
         Hz *= param["unit_t"] / mpc_to_km  # km/s/Mpc to BU
         # psi_1lpt = generate_force(param)
 
+        if "nu_density_file" in param:                       # FORK: each species its own spectrum
+            if INITIAL_CONDITIONS.casefold() != "1LPT".casefold():
+                raise NotImplementedError(
+                    f"per-species files are only supported with 1LPT, not {INITIAL_CONDITIONS}")
+            dplus_1 = np.float32(tables[3](lna_start) / tables[3](0))
+            fH_1 = np.float32(tables[4](lna_start) * Hz)
+            noise = generate_white_noise_fourier(param)       # ONE noise for both species
+            positions, velocities = [], []
+            for s in ("baryon", "nu"):                        # this order = relative_masses' order
+                density_k   = noise * get_amplitude_grid(param, param[f"{s}_density_file"]).astype(np.float32)
+                delta_dot_k = noise * get_amplitude_grid(param, param[f"{s}_velocity_file"]).astype(np.float32)
+                p, v = positions_velocities_1LPT(density_k, delta_dot_k, dplus_1, fH_1, Hz, param)
+                positions.append(p); velocities.append(v)
+            return finalise_initial_conditions(np.concatenate(positions), np.concatenate(velocities),
+                                            param, do_reorder=False)
         # FORK ADDITION: optional per-mode velocities (e.g. from CAMB) instead of
         # the growing mode -- see generate_density_and_velocity_fourier().
         velocity_file = param.get("velocity_file", "")
@@ -159,8 +175,8 @@ def generate(
         if INITIAL_CONDITIONS.casefold() == "1LPT".casefold():
             position = position.reshape(param["npart"], 3)
             velocity = velocity.reshape(param["npart"], 3)
-            finalise_initial_conditions(position, velocity, param, do_reorder=False)
-            return position, velocity
+            return finalise_initial_conditions(position, velocity, param, do_reorder=False)
+
         # 2LPT
         logging.warning("Compute 2LPT contribution")
         density_2 = compute_2ndorder_rhs(potential_1_fourier, param)
@@ -180,8 +196,8 @@ def generate(
         if INITIAL_CONDITIONS.casefold() == "2LPT".casefold():
             position = position.reshape(param["npart"], 3)
             velocity = velocity.reshape(param["npart"], 3)
-            finalise_initial_conditions(position, velocity, param, do_reorder=False)
-            return position, velocity
+            return finalise_initial_conditions(position, velocity, param, do_reorder=False)
+
         # 3LPT
         dplus_3a = -np.float32(tables[7](lna_start) / dplus_1_z0**3)
         f3a = tables[8](lna_start)
@@ -225,8 +241,7 @@ def generate(
         if INITIAL_CONDITIONS.casefold() == "3LPT".casefold():
             position = position.reshape(param["npart"], 3)
             velocity = velocity.reshape(param["npart"], 3)
-            finalise_initial_conditions(position, velocity, param, do_reorder=False)
-            return position, velocity
+            return finalise_initial_conditions(position, velocity, param, do_reorder=False)
         else:
             raise ValueError(f"{INITIAL_CONDITIONS=}, should be 1LPT, 2LPT or 3LPT")
     elif INITIAL_CONDITIONS.casefold() == "tophat":
@@ -272,16 +287,35 @@ def generate(
         position, velocity = initialise_1LPT(psi_1lpt, dplus_1, fH_1, param)
         position = position.reshape(param["npart"], 3)
         velocity = velocity.reshape(param["npart"], 3)
-        finalise_initial_conditions(position, velocity, param, do_reorder=False)
-        return position, velocity
+        return finalise_initial_conditions(position, velocity, param, do_reorder=False)
     elif INITIAL_CONDITIONS[-3:].casefold() == ".h5".casefold():
         position, velocity = read_hdf5(param)
-        finalise_initial_conditions(position, velocity, param, do_reorder=True)
-        return position, velocity
+        return finalise_initial_conditions(position, velocity, param, do_reorder=True)
     else:  # Gadget format
         position, velocity = read_gadget(param)
-        finalise_initial_conditions(position, velocity, param, do_reorder=True)
-        return position, velocity
+        return finalise_initial_conditions(position, velocity, param, do_reorder=True)
+
+def positions_velocities_1LPT(density_fourier, delta_dot_fourier, dplus_1, fH_1, Hz, param):
+    """FORK: positions and velocities of one species 
+    from its delta_k and d(delta)/dln(a)_k (1LPT). 
+    Both inputs are overwritten."""
+    fourier.inverse_laplacian(density_fourier)
+    potential_1_fourier = density_fourier
+    del density_fourier
+    psi_1lpt_fourier = fourier.gradient(potential_1_fourier)
+    psi_1lpt = fourier.ifft_3D_real_grad(psi_1lpt_fourier, param["nthreads"])
+    psi_1lpt_fourier = 0
+    # 1LPT
+    logging.warning("Compute 1LPT contribution")
+    position, velocity = initialise_1LPT(psi_1lpt, dplus_1, fH_1, param)
+    fourier.inverse_laplacian(delta_dot_fourier)
+    psi_v_fourier = fourier.gradient(delta_dot_fourier)
+    delta_dot_fourier = 0
+    psi_v = fourier.ifft_3D_real_grad(psi_v_fourier, param["nthreads"])
+    psi_v_fourier = 0
+    _, velocity = initialise_1LPT(psi_v, dplus_1, np.float32(Hz), param)
+    psi_v = 0           
+    return position.reshape(param["npart"], 3), velocity.reshape(param["npart"], 3)
 
 
 def finalise_initial_conditions(
@@ -322,6 +356,11 @@ def finalise_initial_conditions(
     >>> finalise_initial_conditions(position, velocity, param, True)
     """
 
+    if param.get("baryon_fraction", 0.0) > 0 and len(position) == param["npart"]:  # FORK: one baryon + one neutrino per lattice site
+        position = np.concatenate([position, position])
+        velocity = np.concatenate([velocity, velocity])
+
+
     if "base" not in param:
         raise ValueError(f"{param.index=}, should contain 'base'")
 
@@ -343,12 +382,16 @@ def finalise_initial_conditions(
             )
         case "hdf5":
             snap_name = f"{param['base']}/output_00000/particles_{param['extra']}.h5"
-            iostream.write_snapshot_particles_hdf5(snap_name, position, velocity, param)
+            iostream.write_snapshot_particles_hdf5(
+                snap_name, position, velocity, param, species.relative_masses(param)
+            )
         case _:
             raise NotImplementedError(
                 f"{param['snapshot_format']=}, should be 'parquet' or 'hdf5'"
             )
     logging.warning(f"Write initial snapshot...{snap_name=}")
+
+    return position, velocity #FORK
 
 
 def read_hdf5(
@@ -757,6 +800,12 @@ def get_velocity_transfer_grid(param: pd.Series) -> npt.NDArray[np.float32]:
     """
     k, V = np.loadtxt(param["velocity_file"], comments="#").T
     return amplitude_on_grid(param, k, V)
+
+
+def get_amplitude_grid(param, filename):
+    """FORK: get_transfer_grid doesn't work with signed amplitudes"""
+    k, amplitude = np.loadtxt(filename, comments="#").T
+    return amplitude_on_grid(param, k, amplitude)
 
 
 def amplitude_on_grid(

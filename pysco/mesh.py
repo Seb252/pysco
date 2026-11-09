@@ -2359,6 +2359,91 @@ def CIC(position: npt.NDArray[np.float32], ncells_1d: int) -> npt.NDArray[np.flo
 
 
 @utils.time_me
+@njit(["f4[:,:,::1](f4[:,::1], f4[::1], i2)"], fastmath=True, cache=True, parallel=True)
+def CIC_weighted(
+    position: npt.NDArray[np.float32], mass: npt.NDArray[np.float32], ncells_1d: int
+) -> npt.NDArray[np.float32]:
+    """Cloud-in-Cell interpolation with a mass per particle (FORK: see species.py)
+
+    Computes density on a grid from particle distribution
+
+    Uses atomic operations for thread safety
+
+    Parameters
+    ----------
+    position : npt.NDArray[np.float32]
+        Position [N_part, 3]
+    mass : npt.NDArray[np.float32]
+        Particle masses relative to the mean [N_part]
+    ncells_1d : int
+        Number of cells along one direction
+
+    Returns
+    -------
+    npt.NDArray[np.float32]
+        Density [N_cells_1d, N_cells_1d, N_cells_1d]
+
+    Examples
+    --------
+    >>> import numpy as np
+    >>> from pysco.mesh import CIC_weighted
+    >>> particles = np.random.rand(32**3, 3).astype(np.float32)
+    >>> mass = np.ones(32**3, dtype=np.float32)
+    >>> grid_density = CIC_weighted(particles, mass, ncells_1d=64)
+    """
+    ncells_1d_f = np.float32(ncells_1d)
+    one = np.float32(1)
+    half = np.float32(0.5)
+    result = np.empty((ncells_1d, ncells_1d, ncells_1d), dtype=np.float32)
+    utils.initialise_zero(result)
+    for n in prange(position.shape[0]):
+        m = mass[n]
+        x_part = position[n, 0] * ncells_1d_f
+        y_part = position[n, 1] * ncells_1d_f
+        z_part = position[n, 2] * ncells_1d_f
+
+        i = np.int16(x_part)
+        j = np.int16(y_part)
+        k = np.int16(z_part)
+
+        dx = x_part - half - np.float32(i)
+        dy = y_part - half - np.float32(j)
+        dz = z_part - half - np.float32(k)
+        signx = int(np.sign(dx))
+        signy = int(np.sign(dy))
+        signz = int(np.sign(dz))
+        dx = abs(dx)
+        dy = abs(dy)
+        dz = abs(dz)
+
+        wx = one - dx
+        wy = one - dy
+        wz = one - dz
+
+        i2 = (i + signx) % ncells_1d
+        j2 = (j + signy) % ncells_1d
+        k2 = (k + signz) % ncells_1d
+
+        weight = wx * wy * wz * m
+        atomic_add(result, (i, j, k), weight)
+        weight = wx * wy * dz * m
+        atomic_add(result, (i, j, k2), weight)
+        weight = wx * dy * wz * m
+        atomic_add(result, (i, j2, k), weight)
+        weight = wx * dy * dz * m
+        atomic_add(result, (i, j2, k2), weight)
+        weight = dx * wy * wz * m
+        atomic_add(result, (i2, j, k), weight)
+        weight = dx * wy * dz * m
+        atomic_add(result, (i2, j, k2), weight)
+        weight = dx * dy * wz * m
+        atomic_add(result, (i2, j2, k), weight)
+        weight = dx * dy * dz * m
+        atomic_add(result, (i2, j2, k2), weight)
+    return result
+
+
+@utils.time_me
 @njit(["f4[:,:,::1](f4[:,::1], i2)"], fastmath=True, cache=True)
 def TSC_seq(
     position: npt.NDArray[np.float32], ncells_1d: int
